@@ -127,4 +127,3 @@ def get_state(token: str, db: Session = Depends(get_db)):
         ],
         "logs": WORLD_CHAT[-10:]
     }
-    
