@@ -4,7 +4,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from models import engine, SessionLocal, init_db, User, UserSession, Character, Location, Item, Inventory
-
+from game_logic import player_attack, player_move, use_item, add_item
 
 app = FastAPI(title="Text RPG Server")
 init_db()
@@ -24,6 +24,18 @@ class AuthReq(BaseModel):
     username: str
     password: str
 
+class MoveReq(BaseModel):
+    token: str
+    location_id: int
+    
+class AttackReq(BaseModel):
+    token: int
+    damage: int
+    enemy_key: int
+    
+class ItemReq(BaseModel):
+    token: str
+    item_id: int
 
 def get_current_user(token: str, db: Session) -> User:
     session = db.query(UserSession).filter(UserSession.session_token == token).first()
@@ -127,3 +139,25 @@ def get_state(token: str, db: Session = Depends(get_db)):
         ],
         "logs": WORLD_CHAT[-10:]
     }
+    
+@app.post("/user/move")
+def player_server_move(data: MoveReq, db: Session = Depends(get_db)):
+    user = get_current_user(data.token, db)
+    message = player_move(user, data.location_id, db)
+
+    WORLD_CHAT.append(
+        f"[МИР]: {user.character.character_name} перешел в новую локацию."
+    )
+    return {"status": "ok", "message": message}
+
+@app.post("/user/attack")
+def player_server_attack(data: AttackReq, db: Session = Depends(get_db)):
+    user = get_current_user(data.token, db)
+    battle_result = player_attack(user, data.enemy_key, data.damage, db)
+    return {"status": "ok", **battle_result}
+
+@app.post("/user/use_item")
+def player_sever_use_item(data: ItemReq, db: Session = Depends(get_db)):
+    user = get_current_user(data.token, db)
+    result = use_item(user, db, data.item_id)
+    return {"status": "ok", "result": result}
