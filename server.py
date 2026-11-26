@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -10,6 +10,7 @@ app = FastAPI(title="Text RPG Server")
 init_db()
 
 WORLD_CHAT = ["[СИСТЕМА]: Сервер запущен!"]
+LAST_SEEN = {}
 
 
 def get_db():
@@ -24,31 +25,54 @@ class AuthReq(BaseModel):
     username: str
     password: str
 
+
 class MoveReq(BaseModel):
     token: str
     location_id: int
-    
+
+
 class AttackReq(BaseModel):
-    token: int
+    token: str
     damage: int
-    enemy_key: int
-    
+    enemy_key: str
+
+
 class ItemReq(BaseModel):
     token: str
     item_id: int
 
+
+class LogoutReq(BaseModel):
+    token: str
+
+class ChatReq(BaseModel):
+    token: str
+    comment: str
+
+@app.post("/chat/send")
+def send_chat_message(data: ChatReq, db: Session = Depends(get_db)):
+    user = get_current_user(data, db)
+    text = data.comment.strip()
+    
+    if not text:
+        raise HTTPException(status_code=401, detail="Ошибка")
+    
+    char_user = user.character.character_name if user.character else user.username
+    WORLD_CHAT.append(f"{char_user}: {text}")
+    
+    if len(WORLD_CHAT) >= 50:
+        del WORLD_CHAT[:-50]
+        
+    return {"status": "ok"}
+
 def get_current_user(token: str, db: Session) -> User:
     session = db.query(UserSession).filter(UserSession.session_token == token).first()
-    if not session or (session.expires_at and session.expires_at < datetime.utcnow()):
+    if not session:
         raise HTTPException(
             status_code=401,
-            detail="Сессия истекла или не найдена. Войдите заново."
+            detail="Сессия не найдена. Войдите заново."
         )
-
-    session.expires_at = datetime.utcnow() + timedelta(minutes=5)
-    db.commit()
     return session.user
-
 
 @app.post("/register")
 def register(data: AuthReq, db: Session = Depends(get_db)):
@@ -95,16 +119,18 @@ def login(data: AuthReq, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
+    db.query(UserSession).filter(UserSession.user_id == user.user_id).delete()
     token = str(uuid.uuid4())
     new_session = UserSession(
         session_token=token,
         user_id=user.user_id,
         created_at=datetime.utcnow(),
-        expires_at=datetime.utcnow() + timedelta(minutes=5)
+        expires_at=None
     )
     db.add(new_session)
     db.commit()
 
+    LAST_SEEN[user.username] = datetime.utcnow()
     return {"token": token, "username": user.username}
 
 
@@ -114,8 +140,12 @@ def get_state(token: str, db: Session = Depends(get_db)):
     char = user.character
 
     now = datetime.utcnow()
-    active_sessions = db.query(UserSession).filter(UserSession.expires_at >= now).all()
-    online_names = list({s.user.username for s in active_sessions if s.user})
+    LAST_SEEN[user.username] = now
+
+    online_names = [
+        uname for uname, last_time in list(LAST_SEEN.items())
+        if (now - last_time).total_seconds() <= 4
+    ]
 
     leaders = db.query(Character).order_by(Character.character_level.desc()).limit(5).all()
     locations = db.query(Location).all()
@@ -127,7 +157,7 @@ def get_state(token: str, db: Session = Depends(get_db)):
             "level": char.character_level,
             "location": user.location.location_name if user.location else "Таверна",
             "inventory": [
-                {"name": inv.item.item_name, "count": inv.quantity}
+                {"id": inv.item.item_id, "name": inv.item.item_name, "count": inv.quantity}
                 for inv in char.inventory_items if inv.item
             ]
         },
@@ -139,7 +169,22 @@ def get_state(token: str, db: Session = Depends(get_db)):
         ],
         "logs": WORLD_CHAT[-10:]
     }
-    
+
+
+@app.post("/user/logout")
+def logout(user: LogoutReq, db: Session = Depends(get_db)):
+    session = db.query(UserSession).filter(UserSession.session_token == user.token).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    if session.user:
+        LAST_SEEN.pop(session.user.username, None)
+
+    db.delete(session)
+    db.commit()
+    return {"status": "ok", "message": "Токен был удален"}
+
+
 @app.post("/user/move")
 def player_server_move(data: MoveReq, db: Session = Depends(get_db)):
     user = get_current_user(data.token, db)
@@ -150,14 +195,55 @@ def player_server_move(data: MoveReq, db: Session = Depends(get_db)):
     )
     return {"status": "ok", "message": message}
 
+
 @app.post("/user/attack")
 def player_server_attack(data: AttackReq, db: Session = Depends(get_db)):
     user = get_current_user(data.token, db)
     battle_result = player_attack(user, data.enemy_key, data.damage, db)
     return {"status": "ok", **battle_result}
 
+
 @app.post("/user/use_item")
 def player_sever_use_item(data: ItemReq, db: Session = Depends(get_db)):
     user = get_current_user(data.token, db)
     result = use_item(user, db, data.item_id)
     return {"status": "ok", "result": result}
+
+def seed_locations():
+    db = SessionLocal()
+    try:
+        default_locations = [
+            "Таверна",
+            "Тёмный лес",
+            "Старая мельница",
+            "Заброшенные руины",
+            "Замок Камелот"
+        ]
+        for name in default_locations:
+            if not db.query(Location).filter(Location.location_name == name).first():
+                db.add(Location(location_name=name))
+        db.commit()
+    finally:
+        db.close()
+
+@app.get("/online/{token}")     
+def show_users(token: str, db: Session = Depends(get_db)):
+    user = get_current_user(token, db)
+    char = user.character
+    
+    now = datetime.utcnow()
+    LAST_SEEN[user.username] = now
+    
+    online_names = [
+        uname for uname, last_time in list(LAST_SEEN.items())
+        if (now - last_time).total_seconds() <= 4
+    ]
+    
+    return {
+        "player": {
+                    "username": char.character_name,
+                    "level": char.character_level,
+                },
+                "online_players": online_names,
+    }
+    
